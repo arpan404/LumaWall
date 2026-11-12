@@ -8,6 +8,7 @@ let package = Package(
     products: [
         .library(name: "LumaWallCore", targets: ["LumaWallCore"]),
         .executable(name: "LumaWall", targets: ["LumaWallApp"]),
+        .executable(name: "LumaWallBenchmarks", targets: ["LumaWallBenchmarks"]),
     ],
     targets: [
         .target(name: "LumaWallCore"),
@@ -15,6 +16,11 @@ let package = Package(
             name: "LumaWallApp",
             dependencies: ["LumaWallCore"],
             resources: [.process("Resources")]
+        ),
+        .executableTarget(
+            name: "LumaWallBenchmarks",
+            dependencies: ["LumaWallCore"],
+            path: "Tools/Benchmarks/Sources/LumaWallBenchmarks"
         ),
         .testTarget(name: "LumaWallCoreTests", dependencies: ["LumaWallCore"]),
     ]
