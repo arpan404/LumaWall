@@ -528,10 +528,10 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				2D57B861D0FB2493BBA95DD4 /* LumaWall */,
-				E32FF0342909C645D768D9D0 /* LumaWallAppTests */,
 				22C2B7943BA518610EEEA10B /* LumaWallCore */,
+				2D57B861D0FB2493BBA95DD4 /* LumaWall */,
 				BA7D381497A1D253E7C909D8 /* LumaWallWallpaper */,
+				E32FF0342909C645D768D9D0 /* LumaWallAppTests */,
 			);
 		};
 /* End PBXProject section */
