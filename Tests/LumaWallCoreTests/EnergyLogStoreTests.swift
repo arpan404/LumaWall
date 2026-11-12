@@ -80,6 +80,29 @@ struct EnergyLogStoreTests {
         #expect(report?.proofSummary.contains("LumaWall Energy Log") == true)
     }
 
+    @Test func persistsCompactJSONWithoutPrettyPrinting() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try EnergyLogStore(rootURL: root)
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        try await store.startSoak(at: now)
+        try await store.record(EnergySample(
+            date: now,
+            processCPUPercent: 1.5, systemCPUPercent: 2.5, processMemoryMB: 100,
+            batteryPercent: 80, isOnBattery: true, decoderCount: 1,
+            powerProfile: "automatic", playbackActive: true
+        ), now: now)
+
+        let url = root.appendingPathComponent("EnergyLog.json")
+        let text = try #require(String(data: Data(contentsOf: url), encoding: .utf8))
+        #expect(!text.contains("\n"))
+        #expect(!text.contains("\r"))
+        #expect(!text.contains("  "))
+        // Compact output still decodes to the same snapshot.
+        let snapshot = await store.current()
+        #expect(StoreIO.readJSON(from: url, as: EnergyLogSnapshot.self) == snapshot)
+    }
+
     @Test func clearSoakResetsWindowButKeepsSamples() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: root) }

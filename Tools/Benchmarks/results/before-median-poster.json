@@ -1,0 +1,9 @@
+{
+  "name": "poster.coldLoad",
+  "note": "4K JPEG; coldMS=load, warmMS=first draw (decode)",
+  "unit": "ms",
+  "coldMS": 0.269875,
+  "warmMS": 5.961375,
+  "pixelsWide": 3840,
+  "pixelsHigh": 2160
+}

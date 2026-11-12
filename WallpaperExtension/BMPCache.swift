@@ -2,6 +2,7 @@ import AVFoundation
 import CryptoKit
 import Foundation
 import ImageIO
+import os
 
 /// Removes reproducible WallpaperAgent snapshots while preserving every source
 /// video and user assignment. The Agent regenerates the right poster on demand.
@@ -17,6 +18,20 @@ func clearWallpaperSnapshotCache() {
     }
     extensionLog("[BMPCache] Cleared generated wallpaper snapshots")
 }
+
+/// Recently decoded snapshots, keyed by the file's URL plus its modification
+/// date and size. The Agent rewrites snapshots with timestamped filenames, so
+/// this saves re-decoding the same poster across acquire/transition calls. A
+/// couple of entries cover multi-display transitions that alternate choices.
+private struct CachedSnapshotImage: @unchecked Sendable {
+    let url: URL
+    let modificationDate: Date?
+    let fileSize: Int?
+    let image: CGImage
+}
+
+private let cachedSnapshotImages = OSAllocatedUnfairLock(initialState: [URL: CachedSnapshotImage]())
+private let cachedSnapshotImageLimit = 4
 
 /// Load the most recent cached BMP from the Agent's cache directory as a CGImage.
 /// Used to set rootLayer.contents as immediate visual content during transitions,
@@ -47,10 +62,44 @@ func loadCachedSnapshotImage(forChoice videoID: String?) -> CGImage? {
 
     guard let url = bmpURL else { return nil }
 
+    let fileValues = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+    let modificationDate = fileValues?.contentModificationDate
+    let fileSize = fileValues?.fileSize
+
+    // Only reuse a decoded image when the exact on-disk file is unchanged.
+    if fileValues != nil {
+        let cached = cachedSnapshotImages.withLock { cache -> CGImage? in
+            guard let entry = cache[url],
+                  entry.modificationDate == modificationDate,
+                  entry.fileSize == fileSize
+            else { return nil }
+            return entry.image
+        }
+        if let cached {
+            traceLog("  [InitContent] Loaded cached snapshot (decoded cache): \(url.lastPathComponent) (\(cached.width)x\(cached.height))")
+            return cached
+        }
+    }
+
     guard let imageSource = CGImageSourceCreateWithURL(url as CFURL, nil),
           let cgImage = CGImageSourceCreateImageAtIndex(imageSource, 0, nil) else {
         traceLog("  [InitContent] Failed to decode cached BMP: \(url.lastPathComponent)")
         return nil
+    }
+
+    if fileValues != nil {
+        let entry = CachedSnapshotImage(
+            url: url,
+            modificationDate: modificationDate,
+            fileSize: fileSize,
+            image: cgImage,
+        )
+        cachedSnapshotImages.withLock { cache in
+            if cache.count >= cachedSnapshotImageLimit, let oldest = cache.keys.first {
+                cache.removeValue(forKey: oldest)
+            }
+            cache[url] = entry
+        }
     }
 
     traceLog("  [InitContent] Loaded cached snapshot: \(url.lastPathComponent) (\(cgImage.width)x\(cgImage.height))")
@@ -76,9 +125,12 @@ func writeBMPSnapshot(videoURL: URL, videoID: String? = nil, displayPixelWidth: 
 
     let hashHex = videoHash(for: videoID ?? videoURL.lastPathComponent)
 
+    // List once: reused for the existing-dimension check and stale cleanup.
+    let existingFiles = try? FileManager.default.contentsOfDirectory(at: cacheDir, includingPropertiesForKeys: nil)
+
     // Check if existing BMP for this video already matches requested dimensions
-    if let existing = try? FileManager.default.contentsOfDirectory(at: cacheDir, includingPropertiesForKeys: nil) {
-        for bmp in existing where bmp.pathExtension == "bmp" && bmp.lastPathComponent.hasPrefix(hashHex) {
+    if let existingFiles {
+        for bmp in existingFiles where bmp.pathExtension == "bmp" && bmp.lastPathComponent.hasPrefix(hashHex) {
             let components = bmp.deletingPathExtension().lastPathComponent.components(separatedBy: "-")
             // Filename format: <64-char-hash>-<width>-<height>-0-<timestamp>
             if components.count == 5,
@@ -104,86 +156,18 @@ func writeBMPSnapshot(videoURL: URL, videoID: String? = nil, displayPixelWidth: 
         return
     }
 
-    let width = cgImage.width
-    let height = cgImage.height
-    let bytesPerPixel = 3 // 24bpp BGR
-    let rawRowBytes = width * bytesPerPixel
-    let paddedRowBytes = (rawRowBytes + 3) & ~3
-    let pixelDataSize = paddedRowBytes * height
-
-    traceLog("  [BMPCache] Rendering \(width)x\(height) BGR24 (\(pixelDataSize) bytes, row=\(paddedRowBytes))")
-
-    let bgraRowBytes = width * 4
-    var bgraData = Data(count: bgraRowBytes * height)
-    let colorSpace = CGColorSpaceCreateDeviceRGB()
-
-    let rendered = bgraData.withUnsafeMutableBytes { rawBuf -> Bool in
-        guard let ctx = CGContext(
-            data: rawBuf.baseAddress,
-            width: width,
-            height: height,
-            bitsPerComponent: 8,
-            bytesPerRow: bgraRowBytes,
-            space: colorSpace,
-            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue,
-        ) else { return false }
-        ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
-        return true
-    }
-
-    guard rendered else {
-        traceLog("  [BMPCache] CGContext render failed")
+    guard let bmp = bmpData(from: cgImage) else {
+        traceLog("  [BMPCache] BMP encode failed for \(cgImage.width)x\(cgImage.height)")
         return
     }
-
-    // Convert BGRA → BGR24 with row padding
-    var pixelData = Data(count: pixelDataSize)
-    bgraData.withUnsafeBytes { bgra in
-        pixelData.withUnsafeMutableBytes { bgr in
-            let src = bgra.baseAddress!.assumingMemoryBound(to: UInt8.self)
-            let dst = bgr.baseAddress!.assumingMemoryBound(to: UInt8.self)
-            for y in 0 ..< height {
-                for x in 0 ..< width {
-                    let si = y * bgraRowBytes + x * 4
-                    let di = y * paddedRowBytes + x * 3
-                    dst[di] = src[si] // B
-                    dst[di + 1] = src[si + 1] // G
-                    dst[di + 2] = src[si + 2] // R
-                }
-            }
-        }
-    }
-
-    // Build BMP: 14-byte file header + 40-byte BITMAPINFOHEADER + pixel data
-    let fileHeaderSize = 14
-    let dibHeaderSize = 40
-    let headerSize = fileHeaderSize + dibHeaderSize
-    let fileSize = headerSize + pixelDataSize
-
-    var bmp = Data(count: headerSize)
-
-    bmp[0] = 0x42; bmp[1] = 0x4D // "BM"
-    bmpWriteLE32(&bmp, offset: 2, value: UInt32(fileSize))
-    bmpWriteLE32(&bmp, offset: 10, value: UInt32(headerSize))
-
-    let d = fileHeaderSize
-    bmpWriteLE32(&bmp, offset: d, value: UInt32(dibHeaderSize))
-    bmpWriteLE32(&bmp, offset: d + 4, value: UInt32(bitPattern: Int32(width)))
-    bmpWriteLE32(&bmp, offset: d + 8, value: UInt32(bitPattern: Int32(-height))) // top-down
-    bmpWriteLE16(&bmp, offset: d + 12, value: 1) // planes
-    bmpWriteLE16(&bmp, offset: d + 14, value: 24) // bits per pixel
-    bmpWriteLE32(&bmp, offset: d + 16, value: 0) // BI_RGB
-    bmpWriteLE32(&bmp, offset: d + 20, value: UInt32(pixelDataSize))
-
-    bmp.append(pixelData)
 
     let timestamp = Date().timeIntervalSinceReferenceDate
     let timestampHex = String(format: "%016llx", timestamp.bitPattern)
     let filename = "\(hashHex)-\(displayPixelWidth)-\(displayPixelHeight)-0-\(timestampHex).bmp"
 
     // Remove old BMP files for this video from cache
-    if let contents = try? FileManager.default.contentsOfDirectory(at: cacheDir, includingPropertiesForKeys: nil) {
-        for file in contents where file.pathExtension == "bmp" && file.lastPathComponent.hasPrefix(hashHex) {
+    if let existingFiles {
+        for file in existingFiles where file.pathExtension == "bmp" && file.lastPathComponent.hasPrefix(hashHex) {
             try? FileManager.default.removeItem(at: file)
         }
     }
@@ -209,16 +193,4 @@ func writeBMPSnapshot(videoURL: URL, videoID: String? = nil, displayPixelWidth: 
 private func videoHash(for identifier: String) -> String {
     let hash = SHA256.hash(data: Data(identifier.utf8))
     return hash.map { String(format: "%02x", $0) }.joined()
-}
-
-private func bmpWriteLE32(_ data: inout Data, offset: Int, value: UInt32) {
-    data[offset] = UInt8(value & 0xFF)
-    data[offset + 1] = UInt8((value >> 8) & 0xFF)
-    data[offset + 2] = UInt8((value >> 16) & 0xFF)
-    data[offset + 3] = UInt8((value >> 24) & 0xFF)
-}
-
-private func bmpWriteLE16(_ data: inout Data, offset: Int, value: UInt16) {
-    data[offset] = UInt8(value & 0xFF)
-    data[offset + 1] = UInt8((value >> 8) & 0xFF)
 }

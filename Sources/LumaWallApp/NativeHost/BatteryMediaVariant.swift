@@ -9,25 +9,56 @@ enum BatteryMediaVariant {
     @MainActor
     private static var inFlight = Set<String>()
 
+    /// Standardized paths of variant files already confirmed on disk. Both
+    /// playback and preview resolution hit this before `FileManager`, which
+    /// otherwise stats the sibling on every apply/tier change.
+    @MainActor
+    private static var knownExisting = Set<String>()
+
     static func url(for asset: WallpaperAsset) -> URL {
-        asset.mediaURL.deletingLastPathComponent().appendingPathComponent("Wallpaper.battery.mov")
+        variantURL(for: asset.mediaURL)
     }
 
+    private static func variantURL(for mediaURL: URL) -> URL {
+        mediaURL.deletingLastPathComponent().appendingPathComponent("Wallpaper.battery.mov")
+    }
+
+    @MainActor
     static func resolvedURL(for asset: WallpaperAsset, tier: PlaybackTier) -> URL {
-        let variant = url(for: asset)
         switch tier {
         case .reduced, .minimal:
-            if FileManager.default.fileExists(atPath: variant.path) { return variant }
+            if let variant = existingVariant(for: url(for: asset)) { return variant }
             return asset.mediaURL
         default:
             return asset.mediaURL
         }
     }
 
+    /// The battery sibling used for poster/preview frames, when it exists.
+    @MainActor
+    static func resolvedPreviewURL(for mediaURL: URL) -> URL {
+        existingVariant(for: variantURL(for: mediaURL)) ?? mediaURL
+    }
+
+    /// Cache hit, else a single disk check that records the positive result.
+    /// Missing variants are not cached, so a later `ensure` is still seen.
+    @MainActor
+    private static func existingVariant(for variant: URL) -> URL? {
+        let key = variant.standardizedFileURL.path
+        if knownExisting.contains(key) { return variant }
+        guard FileManager.default.fileExists(atPath: variant.path) else { return nil }
+        knownExisting.insert(key)
+        return variant
+    }
+
     @MainActor
     static func ensure(for asset: WallpaperAsset) async {
         let dest = url(for: asset)
-        if FileManager.default.fileExists(atPath: dest.path) { return }
+        let key = dest.standardizedFileURL.path
+        if FileManager.default.fileExists(atPath: dest.path) {
+            knownExisting.insert(key)
+            return
+        }
         // Transcode anything above 720p: the sibling is what reduced/minimal
         // tiers actually play, so without it those profiles only move a bitrate
         // hint and look like they "do nothing". 720p and below play as-is.
@@ -36,9 +67,9 @@ enum BatteryMediaVariant {
         // Applies fan out one ensure per display/session; without this two of
         // them transcode the same source at once (all callers are MainActor,
         // so a plain set suffices).
-        let key = asset.mediaURL.standardizedFileURL.path
-        guard inFlight.insert(key).inserted else { return }
-        defer { inFlight.remove(key) }
+        let sourceKey = asset.mediaURL.standardizedFileURL.path
+        guard inFlight.insert(sourceKey).inserted else { return }
+        defer { inFlight.remove(sourceKey) }
 
         let source = AVURLAsset(url: asset.mediaURL)
         guard let export = AVAssetExportSession(asset: source, presetName: AVAssetExportPreset1280x720)
@@ -51,8 +82,11 @@ enum BatteryMediaVariant {
             if FileManager.default.fileExists(atPath: dest.path) {
                 try? FileManager.default.removeItem(at: dest)
             }
+            knownExisting.remove(key)
             try FileManager.default.moveItem(at: temp, to: dest)
+            knownExisting.insert(key)
         } catch {
+            knownExisting.remove(key)
             try? FileManager.default.removeItem(at: temp)
         }
     }

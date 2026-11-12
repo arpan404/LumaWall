@@ -7,6 +7,17 @@ extension JSONEncoder {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         return encoder
     }
+
+    /// Persistence encoder: ISO-8601 dates for compatibility with existing
+    /// files, no whitespace. The energy log appends a sample every minute, so
+    /// pretty-printing it rewrote hundreds of kilobytes of indentation each
+    /// time without adding any value to a machine-read file.
+    static var lumaWallCompact: JSONEncoder {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = []
+        return encoder
+    }
 }
 
 extension JSONDecoder {
@@ -36,7 +47,7 @@ public enum StorePaths {
 
 public enum StoreIO {
     public static func writeJSON<T: Encodable>(_ value: T, to url: URL) throws {
-        let data = try JSONEncoder.lumaWall.encode(value)
+        let data = try JSONEncoder.lumaWallCompact.encode(value)
         try data.write(to: url, options: [.atomic, .completeFileProtectionUnlessOpen])
     }
 

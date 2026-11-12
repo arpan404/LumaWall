@@ -6,6 +6,7 @@ struct MenuBarPopover: View {
     @Bindable var model: AppModel
     @Environment(\.openWindow) private var openWindow
     @State private var selectedIndex = 0
+    @State private var isVisible = false
     @Namespace private var scopeNamespace
 
     private struct ActiveSlide: Identifiable {
@@ -32,6 +33,8 @@ struct MenuBarPopover: View {
     }
 
     var body: some View {
+        // Diagnostics read the @ObservationIgnored stats; track the tick.
+        let _ = model.statsRevision
         VStack(spacing: 10) {
             headerSection
 
@@ -50,7 +53,11 @@ struct MenuBarPopover: View {
         .padding(14)
         .frame(width: 320)
         .fixedSize(horizontal: false, vertical: true)
-        .onAppear { model.refreshStats() }
+        .onAppear {
+            isVisible = true
+            model.refreshStats()
+        }
+        .onDisappear { isVisible = false }
         .onChange(of: slides.count) { _, count in
             selectedIndex = min(selectedIndex, max(0, count - 1))
         }
@@ -72,7 +79,9 @@ struct MenuBarPopover: View {
     @ViewBuilder
     private var heroSection: some View {
         ZStack {
-            if let slide = currentSlide {
+            // The menu-bar window can keep its SwiftUI content alive after it
+            // closes; only keep a decoder while the popover is actually shown.
+            if let slide = currentSlide, isVisible {
                 LoopingVideoView(url: slide.asset.mediaURL)
                     .id(slide.id)
             }

@@ -50,6 +50,60 @@ final class SharedPlaybackHubTests: XCTestCase {
     }
 
     @MainActor
+    func testFullyPausedHubStopsPumpingAndHoldsEveryFrame() async throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).mov")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try await writeVideo(to: url)
+        let hub = SharedPlaybackHub.acquire(url: url)
+        let layers = [CALayer(), CALayer()]
+        for layer in layers {
+            layer.frame = CGRect(x: 0, y: 0, width: 32, height: 32)
+            hub.attach(layer)
+        }
+        defer {
+            for layer in layers { hub.detach(layer) }
+            hub.release()
+        }
+
+        let deadline = Date().addingTimeInterval(5)
+        while layers.contains(where: { $0.contents == nil }), Date() < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertTrue(layers.allSatisfy { $0.contents != nil }, "The decoder must produce a frame before pausing")
+        let initial = try layers.map(render)
+        XCTAssertEqual(initial[0], initial[1], "Both displays receive the same frame")
+        XCTAssertTrue(hub.isPumping, "An attached, playing hub must run its pump")
+
+        for layer in layers { hub.setLayerPaused(true, for: layer) }
+        XCTAssertFalse(hub.isPumping, "Pausing every display must stop the pump")
+        // Let a tick that was already queued on the main actor drain before
+        // snapshotting the counter; only the idle period must be tick-free.
+        try await Task.sleep(for: .milliseconds(150))
+        let tickCount = hub.pumpTickCount
+        let held = try layers.map(render)
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertFalse(hub.isPumping)
+        XCTAssertEqual(hub.pumpTickCount, tickCount, "A fully paused hub must not tick")
+        let stillHeld = try layers.map(render)
+        XCTAssertEqual(stillHeld, held, "Paused displays must hold their last frames")
+
+        hub.setLayerPaused(false, for: layers[0])
+        XCTAssertTrue(hub.isPumping, "Unpausing one display must restart the pump")
+        let resumeDeadline = Date().addingTimeInterval(3)
+        var resumed = false
+        while Date() < resumeDeadline {
+            try await Task.sleep(for: .milliseconds(50))
+            if try render(layers[0]) != held[0] {
+                resumed = true
+                break
+            }
+        }
+        XCTAssertTrue(resumed, "The unpaused display must receive new frames")
+        XCTAssertEqual(try render(layers[1]), held[1], "The still-paused display must keep its held frame")
+        XCTAssertGreaterThan(hub.pumpTickCount, tickCount)
+    }
+
+    @MainActor
     func testSwitchingFromPrivateToSharedPlaybackKeepsVideoVisible() async throws {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).mov")
         defer { try? FileManager.default.removeItem(at: url) }
