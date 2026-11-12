@@ -2,6 +2,7 @@ import AVFoundation
 import CryptoKit
 import Foundation
 import ImageIO
+import os
 
 /// Removes reproducible WallpaperAgent snapshots while preserving every source
 /// video and user assignment. The Agent regenerates the right poster on demand.
@@ -17,6 +18,20 @@ func clearWallpaperSnapshotCache() {
     }
     extensionLog("[BMPCache] Cleared generated wallpaper snapshots")
 }
+
+/// Recently decoded snapshots, keyed by the file's URL plus its modification
+/// date and size. The Agent rewrites snapshots with timestamped filenames, so
+/// this saves re-decoding the same poster across acquire/transition calls. A
+/// couple of entries cover multi-display transitions that alternate choices.
+private struct CachedSnapshotImage: @unchecked Sendable {
+    let url: URL
+    let modificationDate: Date?
+    let fileSize: Int?
+    let image: CGImage
+}
+
+private let cachedSnapshotImages = OSAllocatedUnfairLock(initialState: [URL: CachedSnapshotImage]())
+private let cachedSnapshotImageLimit = 4
 
 /// Load the most recent cached BMP from the Agent's cache directory as a CGImage.
 /// Used to set rootLayer.contents as immediate visual content during transitions,
@@ -47,10 +62,44 @@ func loadCachedSnapshotImage(forChoice videoID: String?) -> CGImage? {
 
     guard let url = bmpURL else { return nil }
 
+    let fileValues = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+    let modificationDate = fileValues?.contentModificationDate
+    let fileSize = fileValues?.fileSize
+
+    // Only reuse a decoded image when the exact on-disk file is unchanged.
+    if fileValues != nil {
+        let cached = cachedSnapshotImages.withLock { cache -> CGImage? in
+            guard let entry = cache[url],
+                  entry.modificationDate == modificationDate,
+                  entry.fileSize == fileSize
+            else { return nil }
+            return entry.image
+        }
+        if let cached {
+            traceLog("  [InitContent] Loaded cached snapshot (decoded cache): \(url.lastPathComponent) (\(cached.width)x\(cached.height))")
+            return cached
+        }
+    }
+
     guard let imageSource = CGImageSourceCreateWithURL(url as CFURL, nil),
           let cgImage = CGImageSourceCreateImageAtIndex(imageSource, 0, nil) else {
         traceLog("  [InitContent] Failed to decode cached BMP: \(url.lastPathComponent)")
         return nil
+    }
+
+    if fileValues != nil {
+        let entry = CachedSnapshotImage(
+            url: url,
+            modificationDate: modificationDate,
+            fileSize: fileSize,
+            image: cgImage,
+        )
+        cachedSnapshotImages.withLock { cache in
+            if cache.count >= cachedSnapshotImageLimit, let oldest = cache.keys.first {
+                cache.removeValue(forKey: oldest)
+            }
+            cache[url] = entry
+        }
     }
 
     traceLog("  [InitContent] Loaded cached snapshot: \(url.lastPathComponent) (\(cgImage.width)x\(cgImage.height))")
@@ -76,9 +125,12 @@ func writeBMPSnapshot(videoURL: URL, videoID: String? = nil, displayPixelWidth: 
 
     let hashHex = videoHash(for: videoID ?? videoURL.lastPathComponent)
 
+    // List once: reused for the existing-dimension check and stale cleanup.
+    let existingFiles = try? FileManager.default.contentsOfDirectory(at: cacheDir, includingPropertiesForKeys: nil)
+
     // Check if existing BMP for this video already matches requested dimensions
-    if let existing = try? FileManager.default.contentsOfDirectory(at: cacheDir, includingPropertiesForKeys: nil) {
-        for bmp in existing where bmp.pathExtension == "bmp" && bmp.lastPathComponent.hasPrefix(hashHex) {
+    if let existingFiles {
+        for bmp in existingFiles where bmp.pathExtension == "bmp" && bmp.lastPathComponent.hasPrefix(hashHex) {
             let components = bmp.deletingPathExtension().lastPathComponent.components(separatedBy: "-")
             // Filename format: <64-char-hash>-<width>-<height>-0-<timestamp>
             if components.count == 5,
@@ -114,8 +166,8 @@ func writeBMPSnapshot(videoURL: URL, videoID: String? = nil, displayPixelWidth: 
     let filename = "\(hashHex)-\(displayPixelWidth)-\(displayPixelHeight)-0-\(timestampHex).bmp"
 
     // Remove old BMP files for this video from cache
-    if let contents = try? FileManager.default.contentsOfDirectory(at: cacheDir, includingPropertiesForKeys: nil) {
-        for file in contents where file.pathExtension == "bmp" && file.lastPathComponent.hasPrefix(hashHex) {
+    if let existingFiles {
+        for file in existingFiles where file.pathExtension == "bmp" && file.lastPathComponent.hasPrefix(hashHex) {
             try? FileManager.default.removeItem(at: file)
         }
     }

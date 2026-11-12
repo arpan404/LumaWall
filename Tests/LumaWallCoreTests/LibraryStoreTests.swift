@@ -169,6 +169,39 @@ struct LibraryStoreTests {
         #expect(await store.diskUsageBytes() >= 4096)
     }
 
+    @Test func diskUsageIsCachedUntilTheLibraryChanges() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try LibraryStore(rootURL: root)
+        let blob = root.appendingPathComponent("blob.bin")
+        try Data(repeating: 5, count: 4096).write(to: blob)
+
+        let first = await store.diskUsageBytes()
+        let second = await store.diskUsageBytes()
+        #expect(first == second)
+        #expect(first >= 4096)
+
+        // install rewrites the index and invalidates, so the next read must
+        // measure again rather than serve the pre-install total.
+        try await store.install(sampleAsset(hash: "cache-invalidating"))
+        #expect(await store.diskUsageBytes() > first)
+    }
+
+    @Test func storeIOWritesCompactJSONAndRoundTrips() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let url = root.appendingPathComponent("compact.json")
+        let value = CompactFixture(name: "Wallpaper", count: 3)
+
+        try StoreIO.writeJSON(value, to: url)
+        let text = try #require(String(data: Data(contentsOf: url), encoding: .utf8))
+        #expect(!text.contains("\n"))
+        #expect(!text.contains("\r"))
+        #expect(!text.contains("  "))
+        #expect(StoreIO.readJSON(from: url, as: CompactFixture.self) == value)
+    }
+
     @Test func removeRefusesPathsOutsideEntryFolder() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -242,6 +275,11 @@ struct LibraryStoreTests {
         try await store.recordApply(id: older.id, at: Date(timeIntervalSince1970: 1_000))
         try await store.recordApply(id: newer.id, at: Date(timeIntervalSince1970: 2_000))
         #expect(await store.assets(sortedBy: .mostUsed).map(\.contentHash) == ["newer", "older"])
+    }
+
+    private struct CompactFixture: Codable, Equatable {
+        var name: String
+        var count: Int
     }
 
     private func sampleAsset(

@@ -1,0 +1,47 @@
+[
+  {
+    "name": "occlusion.analyze",
+    "note": "3 displays x 1200 windows",
+    "unit": "ms",
+    "warmMS": 0.045625,
+    "bytes": 113
+  },
+  {
+    "name": "library.diskUsage",
+    "note": "600 files / 19 MB",
+    "unit": "ms",
+    "coldMS": 2.399625,
+    "warmMS": 1.366959
+  },
+  {
+    "name": "store.writeEnergyLog",
+    "note": "1440 samples",
+    "unit": "ms",
+    "warmMS": 5.718416,
+    "bytes": 443542
+  },
+  {
+    "name": "theme.accessibilityRead",
+    "note": "upper bound for uncached Theme",
+    "unit": "ns/call",
+    "perUnitNS": 12.49585
+  },
+  {
+    "name": "policy.windowList",
+    "note": "CGWindowListCopyWindowInfo",
+    "unit": "ms",
+    "warmMS": 0.191542
+  },
+  {
+    "name": "power.current",
+    "note": "IOKit power-source read",
+    "unit": "ms",
+    "warmMS": 0.038208
+  },
+  {
+    "name": "variant.fileExists",
+    "note": "per resolvedURL lookup",
+    "unit": "ns/call",
+    "perUnitNS": 1853.40583
+  }
+]

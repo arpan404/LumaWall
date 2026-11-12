@@ -590,7 +590,7 @@ private struct LibraryPage: View {
         ) { selection in
             // Look up live so library reloads while the sheet is open keep
             // working instead of pinning a stale snapshot.
-            if let asset = model.assets.first(where: { $0.id == selection.assetID }) {
+            if let asset = model.asset(for: selection.assetID) {
                 LibraryInspectorSheet(model: model, asset: asset)
             }
         }
@@ -605,18 +605,21 @@ private struct LibraryPage: View {
     }
 
     private var allWallpapersSection: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        // Filtering is O(assets); compute once per body instead of four times
+        // (subtitle, empty checks, grid, toolbar count).
+        let filtered = model.filteredAssets
+        return VStack(alignment: .leading, spacing: 14) {
             shelfHeader(
                 title: "All Wallpapers",
                 subtitle: model.assets.isEmpty
                     ? "Import an MP4 or MOV to start your collection"
-                    : "\(model.filteredAssets.count) of \(model.assets.count) shown",
+                    : "\(filtered.count) of \(model.assets.count) shown",
                 trailing: { EmptyView() }
             )
-            libraryToolbar
+            libraryToolbar(filteredCount: filtered.count)
             if model.assets.isEmpty {
                 EmptyInvite(action: model.chooseVideos)
-            } else if model.filteredAssets.isEmpty {
+            } else if filtered.isEmpty {
                 ContentUnavailableView(
                     "No Matching Wallpapers",
                     systemImage: "rectangle.stack.badge.minus",
@@ -628,7 +631,7 @@ private struct LibraryPage: View {
                     columns: [GridItem(.adaptive(minimum: 210, maximum: 280), spacing: 16)],
                     spacing: 18
                 ) {
-                    ForEach(model.filteredAssets) { asset in
+                    ForEach(filtered) { asset in
                         LibrarySelectionTile(
                             model: model,
                             asset: asset,
@@ -642,10 +645,10 @@ private struct LibraryPage: View {
 
     private var selectedAsset: WallpaperAsset? {
         guard let selectedID else { return nil }
-        return model.assets.first { $0.id == selectedID }
+        return model.asset(for: selectedID)
     }
 
-    private var libraryToolbar: some View {
+    private func libraryToolbar(filteredCount: Int) -> some View {
         HStack(spacing: 10) {
             TextField("Search your library", text: $model.searchText)
                 .textFieldStyle(.roundedBorder)
@@ -671,7 +674,7 @@ private struct LibraryPage: View {
             }
             .toggleStyle(.button)
             Spacer(minLength: 8)
-            Text("\(model.filteredAssets.count) of \(model.assets.count)")
+            Text("\(filteredCount) of \(model.assets.count)")
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(Theme.textDim)
         }
@@ -1749,6 +1752,9 @@ private struct SettingsPage: View {
     @Bindable var model: AppModel
 
     var body: some View {
+        // The CPU/RAM fields are @ObservationIgnored hot stats; this revision
+        // is the observed signal that a 15 s sample landed.
+        let _ = model.statsRevision
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 VStack(alignment: .leading, spacing: 6) {
@@ -1818,7 +1824,7 @@ private struct SettingsPage: View {
                         Divider().overlay(Theme.line)
                         settingsRow(
                             title: L10n.pauseObscured,
-                            detail: "Stops that screen when a window covers about 92% of it.",
+                            detail: "Stops that screen when a window covers about 98% of it.",
                             symbol: "rectangle.slash"
                         ) {
                             Toggle(L10n.pauseObscured, isOn: Binding(
@@ -2019,7 +2025,7 @@ private struct SettingsPage: View {
                         Text(L10n.appName).font(.headline)
                         Text(L10n.tagline)
                             .font(.caption).foregroundStyle(Theme.textDim)
-                        Text("v0.4.0").font(.caption2).foregroundStyle(.secondary)
+                        Text(Self.versionString).font(.caption2).foregroundStyle(.secondary)
                     }
                 }
                 .accessibilityElement(children: .combine)
@@ -2039,6 +2045,12 @@ private struct SettingsPage: View {
         if model.activePlaylistID != nil { return "Playlist" }
         return "Off"
     }
+
+    /// Read once: `body` re-evaluates on every stats tick.
+    private static let versionString: String = {
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0"
+        return "v\(version)"
+    }()
 
     private func settingsGroup<Content: View>(
         title: String,
@@ -2184,12 +2196,16 @@ private struct WallpaperTile: View {
     var width: CGFloat? = nil
     var showCategory: Bool = false
     @State private var hovering = false
+    @State private var showVideo = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             WallpaperPosterFrame(posterURL: asset.posterURL, cornerRadius: 16) {
                 ZStack {
-                    if hovering {
+                    // Hovering a grid tile shouldn't spin up a decoder for every
+                    // pointer pass: wait until the cursor rests before creating
+                    // the player.
+                    if showVideo {
                         LoopingVideoView(url: asset.mediaURL)
                             .scaledToFill()
                             .transition(.opacity)
@@ -2235,7 +2251,17 @@ private struct WallpaperTile: View {
             )
             .shadow(color: .black.opacity(hovering ? 0.28 : 0.14), radius: hovering ? 12 : 6, y: hovering ? 6 : 3)
             .animation(.snappy(duration: 0.22), value: hovering)
-            .onHover { hovering = $0 }
+            .onHover { isHovering in
+                hovering = isHovering
+                if !isHovering { showVideo = false }
+            }
+            .task(id: hovering) {
+                guard hovering else { return }
+                try? await Task.sleep(for: .milliseconds(250))
+                guard !Task.isCancelled, hovering else { return }
+                showVideo = true
+            }
+            .onDisappear { showVideo = false }
 
             VStack(alignment: .leading, spacing: 3) {
                 Text(asset.name)
@@ -2366,7 +2392,7 @@ private struct AssignSheet: View {
 
     private var selectedAsset: WallpaperAsset? {
         guard let selectedID else { return nil }
-        return model.assets.first { $0.id == selectedID }
+        return model.asset(for: selectedID)
     }
 
     var body: some View {

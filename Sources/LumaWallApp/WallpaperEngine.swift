@@ -872,6 +872,8 @@ private final class SessionRootView: NSView {
     private let posterLayer = CALayer()
     private var composition = DisplayComposition()
     private var displayFrame = CGRect.zero
+    private var posterURL: URL?
+    private var posterImage: NSImage?
     private(set) var usesSharedFrames = false
 
     override init(frame frameRect: NSRect) {
@@ -907,9 +909,17 @@ private final class SessionRootView: NSView {
     func apply(composition: DisplayComposition, poster: URL?, displayFrame: CGRect) {
         self.composition = composition
         self.displayFrame = displayFrame
-        if let poster, let image = NSImage(contentsOf: poster) {
-            posterLayer.contents = image
+        // apply() runs on every relayout; decode the poster once per URL, and
+        // downsample it instead of holding a full 4K bitmap per display.
+        if let poster {
+            if posterURL != poster {
+                posterURL = poster
+                posterImage = PosterCache.thumbnailImage(for: poster, maxPixel: 2_560)
+            }
+            posterLayer.contents = posterImage
         } else {
+            posterURL = nil
+            posterImage = nil
             posterLayer.contents = nil
         }
         switch composition.contentMode {

@@ -39,12 +39,15 @@ struct MediaImporterTests {
         let source = try await makeVideo(withAudio: false, in: dir, name: "clip.mov")
         let importer = try MediaImporter(store: store(at: dir))
 
+        let inspection = try await importer.inspect(source)
         let outcome = try await importer.importVideo(source, preferredName: "  Demo  ")
         #expect(outcome.asset.name == "Demo")
         #expect(!outcome.removedAudio)
         #expect(outcome.asset.mediaURL.pathExtension == "mov")
         #expect(FileManager.default.fileExists(atPath: outcome.asset.mediaURL.path))
         #expect(FileManager.default.fileExists(atPath: try #require(outcome.asset.posterURL).path))
+        // Copy-and-hash must match inspect's hash of the same source bytes.
+        #expect(outcome.asset.contentHash == inspection.contentHash)
     }
 
     @Test func blankPreferredNameFallsBackToFilename() async throws {
@@ -63,12 +66,41 @@ struct MediaImporterTests {
         let source = try await makeVideo(withAudio: true, in: dir, name: "talkie.mov")
         let importer = try MediaImporter(store: store(at: dir))
 
+        let sourceAsset = AVURLAsset(url: source)
+        let sourceDuration = CMTimeGetSeconds(try await sourceAsset.load(.duration))
+        let sourceVideoTracks = try await sourceAsset.loadTracks(withMediaType: .video)
+        let sourceTrack = try #require(sourceVideoTracks.first)
+        let sourceSize = try await sourceTrack.load(.naturalSize)
+        let sourceRate = try await sourceTrack.load(.nominalFrameRate)
+        let sourceInspection = try await importer.inspect(source)
+
         let outcome = try await importer.importVideo(source)
         #expect(outcome.removedAudio)
         #expect(outcome.asset.mediaURL.lastPathComponent == "Wallpaper.mov")
         let output = AVURLAsset(url: outcome.asset.mediaURL)
         #expect(try await output.loadTracks(withMediaType: .audio).isEmpty)
-        #expect(!(try await output.loadTracks(withMediaType: .video).isEmpty))
+        let outputVideoTracks = try await output.loadTracks(withMediaType: .video)
+        let outputTrack = try #require(outputVideoTracks.first)
+
+        // Stripping audio must not change the playback metadata.
+        let outputDuration = CMTimeGetSeconds(try await output.load(.duration))
+        let outputSize = try await outputTrack.load(.naturalSize)
+        let outputRate = try await outputTrack.load(.nominalFrameRate)
+        #expect(abs(outputDuration - sourceDuration) < 0.1)
+        #expect(abs(outputSize.width - sourceSize.width) < 1)
+        #expect(abs(outputSize.height - sourceSize.height) < 1)
+        #expect(abs(outputRate - sourceRate) < 0.5)
+
+        // The stored asset keeps the source's inspection values, and records
+        // that audio was removed.
+        #expect(abs(outcome.asset.duration - sourceDuration) < 0.1)
+        #expect(abs(outcome.asset.framesPerSecond - Double(sourceRate)) < 0.5)
+        #expect(abs(outcome.asset.pixelSize.width - sourceSize.width) < 1)
+        #expect(outcome.inspection.containsAudio)
+        #expect(!outcome.asset.containsAudio)
+        // Audio imports keep the source hash so existing library entries are
+        // still recognized as duplicates after an upgrade.
+        #expect(outcome.asset.contentHash == sourceInspection.contentHash)
     }
 
     @Test func duplicateImportThrowsDuplicate() async throws {
@@ -77,10 +109,29 @@ struct MediaImporterTests {
         let source = try await makeVideo(withAudio: false, in: dir, name: "once.mov")
         let importer = try MediaImporter(store: store(at: dir))
         _ = try await importer.importVideo(source)
+        let libraryRoot = dir.appendingPathComponent("Library", isDirectory: true)
+        let before = try FileManager.default.contentsOfDirectory(atPath: libraryRoot.path).sorted()
 
-        await #expect(throws: LibraryStore.StoreError.self) {
-            try await importer.importVideo(source)
-        }
+        await expectDuplicate(importer, source)
+
+        // The failed import's copy must not be left behind as an orphan.
+        let after = try FileManager.default.contentsOfDirectory(atPath: libraryRoot.path).sorted()
+        #expect(after == before)
+    }
+
+    @Test func duplicateAudioImportThrowsAndCleansUp() async throws {
+        let dir = isolatedDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let source = try await makeVideo(withAudio: true, in: dir, name: "talkie-once.mov")
+        let importer = try MediaImporter(store: store(at: dir))
+        _ = try await importer.importVideo(source)
+        let libraryRoot = dir.appendingPathComponent("Library", isDirectory: true)
+        let before = try FileManager.default.contentsOfDirectory(atPath: libraryRoot.path).sorted()
+
+        await expectDuplicate(importer, source)
+
+        let after = try FileManager.default.contentsOfDirectory(atPath: libraryRoot.path).sorted()
+        #expect(after == before)
     }
 
     @Test func inspectRejectsNonVideo() async throws {
@@ -154,6 +205,21 @@ struct MediaImporterTests {
 
     private func store(at dir: URL) throws -> LibraryStore {
         try LibraryStore(rootURL: dir.appendingPathComponent("Library", isDirectory: true))
+    }
+
+    /// Asserts that importing `source` again fails specifically as a duplicate.
+    private func expectDuplicate(_ importer: MediaImporter, _ source: URL) async {
+        do {
+            _ = try await importer.importVideo(source)
+            Issue.record("expected duplicate import to throw")
+        } catch let error as LibraryStore.StoreError {
+            guard case .duplicate = error else {
+                Issue.record("expected duplicate, got \(error)")
+                return
+            }
+        } catch {
+            Issue.record("expected duplicate, got \(error)")
+        }
     }
 
     /// Encodes a 1-second 1280×720 black H.264 movie, optionally with a silent

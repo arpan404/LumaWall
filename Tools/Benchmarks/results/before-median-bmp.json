@@ -1,0 +1,7 @@
+{
+  "checksum": "c8c4e717db21c75b",
+  "name": "bmp.encode4K",
+  "note": "3840x2160 BGR24 + header",
+  "unit": "ms",
+  "warmMS": 7.871041
+}

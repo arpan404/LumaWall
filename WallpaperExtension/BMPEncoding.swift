@@ -1,3 +1,4 @@
+import Accelerate
 import CoreGraphics
 import Foundation
 
@@ -9,13 +10,19 @@ import Foundation
 func bmpData(from image: CGImage) -> Data? {
     let width = image.width
     let height = image.height
-    let bytesPerPixel = 3 // 24bpp BGR
-    let rawRowBytes = width * bytesPerPixel
-    let paddedRowBytes = (rawRowBytes + 3) & ~3
-    let pixelDataSize = paddedRowBytes * height
+    guard width > 0, height > 0 else { return nil }
 
-    let bgraRowBytes = width * 4
-    var bgraData = Data(count: bgraRowBytes * height)
+    let bytesPerPixel = 3 // 24bpp BGR
+    let (rawRowBytes, rowOverflow) = width.multipliedReportingOverflow(by: bytesPerPixel)
+    let (bgraRowBytes, bgraRowOverflow) = width.multipliedReportingOverflow(by: 4)
+    guard !rowOverflow, !bgraRowOverflow else { return nil }
+
+    let paddedRowBytes = (rawRowBytes + 3) & ~3
+    let (pixelDataSize, pixelOverflow) = paddedRowBytes.multipliedReportingOverflow(by: height)
+    let (bgraDataSize, bgraSizeOverflow) = bgraRowBytes.multipliedReportingOverflow(by: height)
+    guard !pixelOverflow, !bgraSizeOverflow else { return nil }
+
+    var bgraData = Data(count: bgraDataSize)
     let colorSpace = CGColorSpaceCreateDeviceRGB()
 
     let rendered = bgraData.withUnsafeMutableBytes { rawBuf -> Bool in
@@ -34,12 +41,47 @@ func bmpData(from image: CGImage) -> Data? {
 
     guard rendered else { return nil }
 
-    // Convert BGRA → BGR24 with row padding
-    var pixelData = Data(count: pixelDataSize)
-    bgraData.withUnsafeBytes { bgra in
-        pixelData.withUnsafeMutableBytes { bgr in
-            let src = bgra.baseAddress!.assumingMemoryBound(to: UInt8.self)
-            let dst = bgr.baseAddress!.assumingMemoryBound(to: UInt8.self)
+    // Build BMP: 14-byte file header + 40-byte BITMAPINFOHEADER + pixel data.
+    // The destination Data is zeroed, so row padding and any bytes vImage does
+    // not touch stay zero as the BMP format expects.
+    let fileHeaderSize = 14
+    let dibHeaderSize = 40
+    let headerSize = fileHeaderSize + dibHeaderSize
+    let fileSize = headerSize + pixelDataSize
+
+    var bmp = Data(count: fileSize)
+
+    // The CGContext uses premultipliedFirst + little-endian, whose memory layout
+    // is BGRA. vImage's RGBA8888 -> RGB888 conversion copies the first three
+    // bytes of each pixel in order, so feeding it the BGRA buffer emits BGR —
+    // exactly the byte order this BMP needs — and drops alpha in one pass.
+    let converted = bgraData.withUnsafeBytes { srcRaw -> Bool in
+        bmp.withUnsafeMutableBytes { dstRaw -> Bool in
+            guard let srcBase = srcRaw.baseAddress,
+                  let dstBase = dstRaw.baseAddress else { return false }
+
+            let dstPixelBase = dstBase.advanced(by: headerSize)
+            var srcBuffer = vImage_Buffer(
+                data: UnsafeMutableRawPointer(mutating: srcBase),
+                height: vImagePixelCount(height),
+                width: vImagePixelCount(width),
+                rowBytes: bgraRowBytes,
+            )
+            var dstBuffer = vImage_Buffer(
+                data: dstPixelBase,
+                height: vImagePixelCount(height),
+                width: vImagePixelCount(width),
+                rowBytes: paddedRowBytes,
+            )
+
+            let error = vImageConvert_RGBA8888toRGB888(
+                &srcBuffer, &dstBuffer, vImage_Flags(kvImageNoFlags),
+            )
+            if error == kvImageNoError { return true }
+
+            // Fallback for any vImage failure: the scalar BGRA -> BGR loop.
+            let src = srcBase.assumingMemoryBound(to: UInt8.self)
+            let dst = dstPixelBase.assumingMemoryBound(to: UInt8.self)
             for y in 0 ..< height {
                 for x in 0 ..< width {
                     let si = y * bgraRowBytes + x * 4
@@ -49,16 +91,11 @@ func bmpData(from image: CGImage) -> Data? {
                     dst[di + 2] = src[si + 2] // R
                 }
             }
+            return true
         }
     }
 
-    // Build BMP: 14-byte file header + 40-byte BITMAPINFOHEADER + pixel data
-    let fileHeaderSize = 14
-    let dibHeaderSize = 40
-    let headerSize = fileHeaderSize + dibHeaderSize
-    let fileSize = headerSize + pixelDataSize
-
-    var bmp = Data(count: headerSize)
+    guard converted else { return nil }
 
     bmp[0] = 0x42; bmp[1] = 0x4D // "BM"
     bmpWriteLE32(&bmp, offset: 2, value: UInt32(fileSize))
@@ -73,7 +110,6 @@ func bmpData(from image: CGImage) -> Data? {
     bmpWriteLE32(&bmp, offset: d + 16, value: 0) // BI_RGB
     bmpWriteLE32(&bmp, offset: d + 20, value: UInt32(pixelDataSize))
 
-    bmp.append(pixelData)
     return bmp
 }
 

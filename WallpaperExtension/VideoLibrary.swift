@@ -16,12 +16,22 @@ struct VideoEntry: Codable {
     var audioStripped: Bool?
 }
 
+private struct LibraryState: Sendable {
+    /// Entries in display order (dateAdded ascending).
+    var entries: [VideoEntry] = []
+    /// Same entries keyed by id, for O(1) lookup.
+    var entriesByID: [String: VideoEntry] = [:]
+}
+
 final class VideoLibrary: Sendable {
     static let shared = VideoLibrary()
 
     private let videosDir: URL
     private let indexURL: URL
-    private let lock = OSAllocatedUnfairLock(initialState: [VideoEntry]())
+    private let lock = OSAllocatedUnfairLock(initialState: LibraryState())
+    /// Serializes index compare+write without holding the entry lock during
+    /// disk I/O. Two concurrent saves must not both conclude "unchanged".
+    private let indexSaveLock = OSAllocatedUnfairLock<Data?>(initialState: nil)
 
     private init() {
         let docs = FileManager.default.homeDirectoryForCurrentUser
@@ -35,14 +45,12 @@ final class VideoLibrary: Sendable {
 
     /// All videos currently in the library.
     var entries: [VideoEntry] {
-        lock.withLock { $0 }
+        lock.withLock { $0.entries }
     }
 
     /// Find a video entry by its UUID string.
     func entry(for id: String) -> VideoEntry? {
-        lock.withLock { entries in
-            entries.first { $0.id == id }
-        }
+        lock.withLock { $0.entriesByID[id] }
     }
 
     /// URL to the video file for a given entry.
@@ -91,7 +99,10 @@ final class VideoLibrary: Sendable {
         guard let subdirs = try? fm.contentsOfDirectory(
             at: videosDir, includingPropertiesForKeys: nil, options: .skipsHiddenFiles,
         ) else {
-            lock.withLock { $0 = [] }
+            lock.withLock { state in
+                state.entries = []
+                state.entriesByID = [:]
+            }
             saveIndex([])
             return
         }
@@ -148,7 +159,11 @@ final class VideoLibrary: Sendable {
 
         discovered.sort { $0.dateAdded < $1.dateAdded }
         let sorted = discovered
-        lock.withLock { $0 = sorted }
+        let byID = Dictionary(sorted.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        lock.withLock { state in
+            state.entries = sorted
+            state.entriesByID = byID
+        }
         saveIndex(sorted)
         traceLog("[VideoLibrary] Scanned: \(sorted.count) video(s)")
     }
@@ -178,7 +193,10 @@ final class VideoLibrary: Sendable {
             let metadataURL = dir.appendingPathComponent("metadata.json")
             try JSONEncoder().encode(entry).write(to: metadataURL)
 
-            lock.withLock { $0.append(entry) }
+            lock.withLock { state in
+                state.entries.append(entry)
+                state.entriesByID[entry.id] = entry
+            }
             saveIndex(entries)
             extensionLog("[VideoLibrary] Added: \(entry.name) (\(id))")
             return id
@@ -199,8 +217,9 @@ final class VideoLibrary: Sendable {
             return
         }
         try? FileManager.default.removeItem(at: dir)
-        lock.withLock { entries in
-            entries.removeAll { $0.id == id }
+        lock.withLock { state in
+            state.entries.removeAll { $0.id == id }
+            state.entriesByID[id] = nil
         }
         saveIndex(entries)
         extensionLog("[VideoLibrary] Removed: \(id)")
@@ -220,11 +239,12 @@ final class VideoLibrary: Sendable {
 
     /// Update metadata for a video entry (e.g., after probing duration/fps/resolution).
     func updateMetadata(for id: String, duration: Double, fps: Double, resolution: CGSize) {
-        lock.withLock { entries in
-            guard let idx = entries.firstIndex(where: { $0.id == id }) else { return }
-            entries[idx].duration = duration
-            entries[idx].fps = fps
-            entries[idx].resolution = resolution
+        lock.withLock { state in
+            guard let idx = state.entries.firstIndex(where: { $0.id == id }) else { return }
+            state.entries[idx].duration = duration
+            state.entries[idx].fps = fps
+            state.entries[idx].resolution = resolution
+            state.entriesByID[id] = state.entries[idx]
         }
         let metadataURL = videosDir
             .appendingPathComponent(id)
@@ -275,7 +295,16 @@ final class VideoLibrary: Sendable {
     // MARK: - Private
 
     private func saveIndex(_ entries: [VideoEntry]) {
-        try? JSONEncoder().encode(entries).write(to: indexURL, options: .atomic)
+        guard let data = try? JSONEncoder().encode(entries) else { return }
+        indexSaveLock.withLock { lastSaved in
+            guard lastSaved != data else { return }
+            do {
+                try data.write(to: indexURL, options: .atomic)
+                lastSaved = data
+            } catch {
+                // Leave the cached data untouched so the next save retries.
+            }
+        }
     }
 
     private func findVideoFile(in directory: URL) -> URL? {

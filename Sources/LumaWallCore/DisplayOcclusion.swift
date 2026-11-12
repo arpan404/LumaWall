@@ -88,11 +88,17 @@ public enum DisplayOcclusion {
         displays: [DisplayFrame],
         windows: [Window]
     ) -> DisplayOcclusionAnalysis {
+        guard !displays.isEmpty, !windows.isEmpty else { return DisplayOcclusionAnalysis() }
+        // Hoisted once: mapping window rects inside the display loop re-copied
+        // every window per display.
+        let rects = windows.map(\.rect)
         var covered: Set<DisplayID> = []
         var fullscreen: Set<DisplayID> = []
         var coverage: [DisplayID: CGFloat] = [:]
+        covered.reserveCapacity(displays.count)
+        fullscreen.reserveCapacity(displays.count)
+        coverage.reserveCapacity(displays.count)
         for display in displays {
-            let rects = windows.map(\.rect)
             let ratio = ScreenGeometry.coverageRatio(screen: display.frame, windows: rects)
             coverage[display.displayID] = ratio
             // Require near-total occlusion before auto-pausing (see
@@ -102,15 +108,28 @@ public enum DisplayOcclusion {
                 covered.insert(display.displayID)
             }
             let ownsFullscreen = windows.contains { window in
-                ScreenGeometry.coverageRatio(screen: display.frame, windows: [window.rect])
+                // Same math as ScreenGeometry.coverageRatio for a one-window
+                // list, without allocating a temporary `[window.rect]` per
+                // window per display.
+                let rect = window.rect
+                return windowCoverageRatio(screen: display.frame, window: rect)
                     >= PlaybackPolicyThresholds.fullscreenCoverage
-                    && abs(window.rect.width - display.frame.width) < PlaybackPolicyThresholds.fullscreenWidthTolerance
-                    && abs(window.rect.height - display.frame.height) < PlaybackPolicyThresholds.fullscreenHeightTolerance
+                    && abs(rect.width - display.frame.width) < PlaybackPolicyThresholds.fullscreenWidthTolerance
+                    && abs(rect.height - display.frame.height) < PlaybackPolicyThresholds.fullscreenHeightTolerance
             }
             if ownsFullscreen {
                 fullscreen.insert(display.displayID)
             }
         }
         return DisplayOcclusionAnalysis(covered: covered, fullscreen: fullscreen, coverage: coverage)
+    }
+
+    /// `ScreenGeometry.coverageRatio(screen:windows:)` for a single window.
+    private static func windowCoverageRatio(screen: CGRect, window: CGRect) -> CGFloat {
+        let area = screen.width * screen.height
+        guard area > 0 else { return 0 }
+        let hit = window.intersection(screen)
+        guard !hit.isNull, !hit.isInfinite else { return 0 }
+        return (hit.width * hit.height) / area
     }
 }

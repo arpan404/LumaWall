@@ -8,3 +8,7 @@ opencode-skills/
 # Local build outputs (including release.sh DMGs).
 dist/
 .bench/
+
+# Raw benchmark runs stay local; the median JSON is the checked-in result.
+Tools/Benchmarks/results/*
+!Tools/Benchmarks/results/*-median-*.json

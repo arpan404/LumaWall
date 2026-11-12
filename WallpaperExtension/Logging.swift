@@ -13,8 +13,14 @@ private let logURL: URL = {
     return dir.appendingPathComponent("extension.log")
 }()
 
-/// Persistent file handle for log writing, protected by a lock.
-private let logLock = OSAllocatedUnfairLock(initialState: nil as FileHandle?)
+private struct LogWriteState: Sendable {
+    var handle: FileHandle?
+    var bytesWritten: UInt64 = 0
+}
+
+/// Persistent file handle and its tracked byte count, protected by a lock.
+/// Tracking the count here avoids a `seekToEnd` syscall for every log line.
+private let logLock = OSAllocatedUnfairLock(initialState: LogWriteState())
 
 /// Cached formatter, `ISO8601DateFormatter` is thread-safe with immutable config.
 /// `nonisolated(unsafe)` because ISO8601DateFormatter doesn't conform to Sendable,
@@ -25,33 +31,15 @@ private nonisolated(unsafe) let logDateFormatter: ISO8601DateFormatter = {
     return f
 }()
 
-/// Get or create the persistent log file handle.
-/// Rotates the log if it exceeds `maxLogSize`.
-private func getLogHandle() -> FileHandle? {
-    logLock.withLock { handle in
-        if let h = handle {
-            // Check size and rotate if needed
-            if (try? h.seekToEnd()) ?? 0 >= maxLogSize {
-                try? h.close()
-                rotateLog()
-                return openLogHandle()
-            }
-            return h
-        }
-        let h = openLogHandle()
-        handle = h
-        return h
+/// Open the persistent log file handle and report its current size.
+private func openLogHandle() -> (handle: FileHandle, size: UInt64)? {
+    if let h = try? FileHandle(forWritingTo: logURL) {
+        return (h, (try? h.seekToEnd()) ?? 0)
     }
-}
-
-private func openLogHandle() -> FileHandle? {
-    guard let h = try? FileHandle(forWritingTo: logURL) else {
-        // File doesn't exist yet, create it
-        FileManager.default.createFile(atPath: logURL.path, contents: nil)
-        return try? FileHandle(forWritingTo: logURL)
-    }
-    _ = try? h.seekToEnd()
-    return h
+    // File doesn't exist yet, create it
+    FileManager.default.createFile(atPath: logURL.path, contents: nil)
+    guard let h = try? FileHandle(forWritingTo: logURL) else { return nil }
+    return (h, 0)
 }
 
 private func rotateLog() {
@@ -88,6 +76,37 @@ private func rotateLog() {
         if fm.fileExists(atPath: staleURL.path) {
             try? fm.removeItem(at: staleURL)
         }
+    }
+}
+
+/// Append one line to the log file. Rotation and the byte counter are handled
+/// under the same lock as the write so concurrent callers can't interleave or
+/// race a rotation. Returns false when no file handle can be opened.
+@discardableResult
+private func writeLogData(_ data: Data) -> Bool {
+    logLock.withLock { state in
+        if state.handle == nil {
+            guard let opened = openLogHandle() else { return false }
+            state.handle = opened.handle
+            state.bytesWritten = opened.size
+        }
+
+        // Check after opening too: a log left over from a previous run may
+        // already be at/over the cap before the first line is appended.
+        if state.bytesWritten >= maxLogSize, let handle = state.handle {
+            try? handle.close()
+            state.handle = nil
+            state.bytesWritten = 0
+            rotateLog()
+            guard let opened = openLogHandle() else { return false }
+            state.handle = opened.handle
+            state.bytesWritten = opened.size
+        }
+
+        guard let handle = state.handle else { return false }
+        handle.write(data)
+        state.bytesWritten += UInt64(data.count)
+        return true
     }
 }
 
@@ -132,10 +151,9 @@ func extensionLog(_ message: String) {
     let ts = logDateFormatter.string(from: Date())
     let line = "[\(ts)] \(message)\n"
     guard let data = line.data(using: .utf8) else { return }
-    guard let handle = getLogHandle() else {
+    guard writeLogData(data) else {
         // Last resort, write directly (creates file if missing)
         try? data.write(to: logURL, options: .atomic)
         return
     }
-    handle.write(data)
 }

@@ -57,6 +57,9 @@ final class AppModel {
     @ObservationIgnored var systemCPUPercent: Double = 0
     var batteryPercent = 100
     var isOnBattery = false
+    /// Bumped once per stats pass; views can track this instead of every
+    /// individual stat field.
+    var statsRevision = 0
     var playlistEditor: PlaylistEditorState?
     var isImporting = false
     var isApplying = false
@@ -84,6 +87,10 @@ final class AppModel {
     var lockAutomationExpanded = true
     private(set) var favoriteIDs: Set<WallpaperID> = []
     private(set) var activeByDisplay: [DisplayID: WallpaperID] = [:]
+    /// Indexes kept in sync with `assets` and `activeByDisplay` so id lookups
+    /// (library grid, menu popover) avoid linear scans.
+    private var assetsByID: [WallpaperID: WallpaperAsset] = [:]
+    private var activeWallpaperIDs: Set<WallpaperID> = []
 
     private let store: LibraryStore
     private let importer: MediaImporter
@@ -285,17 +292,18 @@ final class AppModel {
 
     var featured: WallpaperAsset? {
         if let main = displayCoordinator.mainDisplay(), let id = activeByDisplay[main.displayID],
-           let asset = assets.first(where: { $0.id == id }) {
+           let asset = assetsByID[id] {
             return asset
         }
         return assets.first
     }
 
     var recentAssets: [WallpaperAsset] {
-        recentIDs.compactMap { id in assets.first { $0.id == id } }
+        recentIDs.compactMap { assetsByID[$0] }
     }
 
     var likedAssets: [WallpaperAsset] {
+        // Keep library order; the ID set is the membership test, not the order.
         assets.filter { favoriteIDs.contains($0.id) }
     }
 
@@ -347,10 +355,10 @@ final class AppModel {
     }
 
     func isFavorite(_ asset: WallpaperAsset) -> Bool { favoriteIDs.contains(asset.id) }
-    func isActive(_ asset: WallpaperAsset) -> Bool { activeByDisplay.values.contains(asset.id) }
+    func isActive(_ asset: WallpaperAsset) -> Bool { activeWallpaperIDs.contains(asset.id) }
     func activeName(on display: ConnectedDisplay) -> String? {
         guard let id = activeByDisplay[display.displayID] else { return nil }
-        return assets.first { $0.id == id }?.name
+        return assetsByID[id]?.name
     }
 
     func toggleFavorite(_ asset: WallpaperAsset) {
@@ -695,6 +703,8 @@ final class AppModel {
         displayRefreshWorkItem = nil
         nativeRestoreWorkItem?.cancel()
         nativeRestoreWorkItem = nil
+        policyWorkItem?.cancel()
+        policyWorkItem = nil
         gameModeMonitor.stop()
         powerSourceRegistration.invalidate()
         let center = NotificationCenter.default
@@ -833,7 +843,7 @@ final class AppModel {
     func applyPlaylist(_ playlist: WallpaperPlaylist) {
         let ids = playlist.shuffled ? playlist.wallpaperIDs.shuffled() : playlist.wallpaperIDs
         guard let firstID = ids.first,
-              let asset = assets.first(where: { $0.id == firstID }) else { return }
+              let asset = assetsByID[firstID] else { return }
         automations.dayNightEnabled = false
         automations.appearanceEnabled = false
         persistAutomations()
@@ -849,7 +859,7 @@ final class AppModel {
         playlistCursor = (playlistCursor + delta + playlistIDs.count) % playlistIDs.count
         persistPlaylistPlaybackState()
         let nextID = playlistIDs[playlistCursor]
-        guard let asset = assets.first(where: { $0.id == nextID }) else { return }
+        guard let asset = assetsByID[nextID] else { return }
         applyToAll(asset, continuingPlaylist: true)
     }
 
@@ -878,6 +888,7 @@ final class AppModel {
 
     private var displayRefreshWorkItem: DispatchWorkItem?
     private var nativeRestoreWorkItem: DispatchWorkItem?
+    private var policyWorkItem: DispatchWorkItem?
 
     /// Latched occlusion verdicts (see OcclusionLatch): raw window coverage is
     /// evaluated every policy tick, but the paused verdict holds until coverage
@@ -970,7 +981,7 @@ final class AppModel {
         ) else { return }
         playlistCursor = schedule.cursor
         if playlistCursor != saved.cursor,
-           let asset = assets.first(where: { $0.id == ids[playlistCursor] }) {
+           let asset = assetsByID[ids[playlistCursor]] {
             try? await engine.applyToAll(asset)
         }
         startPlaylistRotation(
@@ -986,7 +997,7 @@ final class AppModel {
 
     func asset(for id: WallpaperID?) -> WallpaperAsset? {
         guard let id else { return nil }
-        return assets.first { $0.id == id }
+        return assetsByID[id]
     }
 
     func setDayNightEnabled(_ enabled: Bool) {
@@ -1244,7 +1255,7 @@ final class AppModel {
         } else {
             return
         }
-        guard let targetID, let asset = assets.first(where: { $0.id == targetID }) else { return }
+        guard let targetID, let asset = assetsByID[targetID] else { return }
         if !force, lastAutomationWallpaperID == targetID { return }
         lastAutomationWallpaperID = targetID
         stopPlaylistRotation()
@@ -1285,7 +1296,7 @@ final class AppModel {
             LocationDaylightProvider.shared.requestIfNeeded()
         }
         if let lockID = automations.lockScreenWallpaperID,
-           let asset = assets.first(where: { $0.id == lockID }) {
+           let asset = assetsByID[lockID] {
             await applyLockScreenWallpaper(asset)
         }
         await consumePendingShortcutIfNeeded()
@@ -1320,6 +1331,7 @@ final class AppModel {
 
     func reload() async {
         assets = await store.assets(sortedBy: librarySort)
+        assetsByID = Dictionary(uniqueKeysWithValues: assets.map { ($0.id, $0) })
         recentIDs = await recentsStore.all()
         refreshActive()
         refreshStats()
@@ -1330,6 +1342,7 @@ final class AppModel {
             guard let wallpaper = engine.wallpaperID(on: id) else { return nil }
             return (id, wallpaper)
         })
+        activeWallpaperIDs = Set(activeByDisplay.values)
         displays = displayCoordinator.displays
     }
 
@@ -1361,10 +1374,11 @@ final class AppModel {
         systemCPUPercent = cpu.system
         let previousPower = PowerStatus(isOnBattery: isOnBattery, percent: batteryPercent)
         let power = PowerStatus.current()
-        batteryPercent = power.percent
-        isOnBattery = power.isOnBattery
+        if batteryPercent != power.percent { batteryPercent = power.percent }
+        if isOnBattery != power.isOnBattery { isOnBattery = power.isOnBattery }
         if power != previousPower {
-            applyPlaybackPolicy()
+            // Reuse the snapshot instead of another IOKit round trip.
+            applyPlaybackPolicy(power: power)
         }
         statsTick += 1
         if includeDiskUsage || statsTick.isMultiple(of: 4) {
@@ -1389,6 +1403,7 @@ final class AppModel {
                 await refreshEnergyReport()
             }
         }
+        statsRevision += 1
     }
 
     private func observeLockAndSleep() {
@@ -1397,7 +1412,7 @@ final class AppModel {
             distributed.addObserver(forName: Notification.Name("com.apple.screenIsLocked"), object: nil, queue: .main) { [weak self] _ in
                 Task { @MainActor in
                     self?.sessionLocked = true
-                    self?.applyPlaybackPolicy()
+                    self?.schedulePlaybackPolicy()
                 }
             }
         )
@@ -1405,7 +1420,7 @@ final class AppModel {
             distributed.addObserver(forName: Notification.Name("com.apple.screenIsUnlocked"), object: nil, queue: .main) { [weak self] _ in
                 Task { @MainActor in
                     self?.sessionLocked = false
-                    self?.applyPlaybackPolicy()
+                    self?.schedulePlaybackPolicy()
                 }
             }
         )
@@ -1414,7 +1429,7 @@ final class AppModel {
             workspace.addObserver(forName: NSWorkspace.screensDidSleepNotification, object: nil, queue: .main) { [weak self] _ in
                 Task { @MainActor in
                     self?.displaysAsleep = true
-                    self?.applyPlaybackPolicy()
+                    self?.schedulePlaybackPolicy()
                 }
             }
         )
@@ -1422,7 +1437,7 @@ final class AppModel {
             workspace.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main) { [weak self] _ in
                 Task { @MainActor in
                     self?.displaysAsleep = false
-                    self?.applyPlaybackPolicy()
+                    self?.schedulePlaybackPolicy()
                     self?.notePlaylistWake()
                 }
             }
@@ -1436,7 +1451,7 @@ final class AppModel {
 
     private func observeGameMode() {
         gameModeMonitor.onChange = { [weak self] in
-            self?.applyPlaybackPolicy()
+            self?.schedulePlaybackPolicy()
         }
         gameModeMonitor.start()
     }
@@ -1476,7 +1491,7 @@ final class AppModel {
         ] {
             powerObservers.append(
                 center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                    Task { @MainActor in self?.applyPlaybackPolicy() }
+                    Task { @MainActor in self?.schedulePlaybackPolicy() }
                 }
             )
         }
@@ -1493,7 +1508,7 @@ final class AppModel {
             guard let context else { return }
             let model = Unmanaged<AppModel>.fromOpaque(context).takeUnretainedValue()
             Task { @MainActor in
-                model.applyPlaybackPolicy()
+                model.schedulePlaybackPolicy()
                 // Power-source rules gate automations: re-evaluate so unplug /
                 // replug applies (or lifts) the rule instead of waiting for
                 // the next timer. Dedup inside evaluate keeps this a no-op
@@ -1519,14 +1534,14 @@ final class AppModel {
         for name in names {
             coverageObservers.append(
                 center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                    Task { @MainActor in self?.applyPlaybackPolicy() }
+                    Task { @MainActor in self?.schedulePlaybackPolicy() }
                 }
             )
         }
         // Workspace/Space notifications handle normal transitions. This slow fallback
         // catches apps that resize opaque windows without publishing a workspace event.
         let timer = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.applyPlaybackPolicy() }
+            Task { @MainActor in self?.schedulePlaybackPolicy() }
         }
         timer.tolerance = 8
         RunLoop.main.add(timer, forMode: .common)
@@ -1534,10 +1549,28 @@ final class AppModel {
         applyPlaybackPolicy()
     }
 
+    /// Coalesce observer bursts (Space switches, lock/wake, power/thermal
+    /// notifications, game mode) into one policy pass. Setters and startup
+    /// keep calling `applyPlaybackPolicy()` directly.
+    private func schedulePlaybackPolicy(delay: TimeInterval = 0.12) {
+        policyWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.applyPlaybackPolicy() }
+        policyWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
     func applyPlaybackPolicy() {
-        let power = PowerStatus.current()
-        batteryPercent = power.percent
-        isOnBattery = power.isOnBattery
+        applyPlaybackPolicy(power: PowerStatus.current())
+    }
+
+    /// Policy pass with the caller's already-read power snapshot. Reads the
+    /// other system conditions once, outside the per-display loop.
+    private func applyPlaybackPolicy(power: PowerStatus) {
+        if batteryPercent != power.percent { batteryPercent = power.percent }
+        if isOnBattery != power.isOnBattery { isOnBattery = power.isOnBattery }
+        let lowPowerMode = ProcessInfo.processInfo.isLowPowerModeEnabled
+        let thermalState = ProcessInfo.processInfo.thermalState
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         let coverage = DisplayOcclusion.analysis(in: displays)
         // Hysteresis: hold the paused verdict until coverage falls back past
         // the release thresholds, so a window sitting at the enter boundary
@@ -1561,8 +1594,8 @@ final class AppModel {
                 profile: powerProfile,
                 isOnBattery: power.isOnBattery,
                 batteryPercent: power.percent,
-                lowPowerMode: ProcessInfo.processInfo.isLowPowerModeEnabled,
-                thermalState: ProcessInfo.processInfo.thermalState,
+                lowPowerMode: lowPowerMode,
+                thermalState: thermalState,
                 displayIsAsleep: displaysAsleep,
                 sessionIsLocked: pauseOnLock && sessionLocked,
                 displayIsObscured: obscured,
@@ -1570,7 +1603,7 @@ final class AppModel {
                 hideDesktopVideo: hideDesktopVideo,
                 allowLiveOnLock: allowLiveOnLock,
                 gameModeActive: gameModeMonitor.isActive,
-                reduceMotion: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+                reduceMotion: reduceMotion
             )
             engine.apply(tier: PlaybackPolicy.resolve(conditions), to: display.displayID)
         }

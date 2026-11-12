@@ -163,6 +163,8 @@ public actor EnergyLogStore {
     }
 
     private func persist() throws {
+        // StoreIO's compact encoder keeps each minute's full-snapshot write
+        // durable without the pretty-printed padding that made it 443 KB.
         try StoreIO.writeJSON(snapshot, to: fileURL)
     }
 

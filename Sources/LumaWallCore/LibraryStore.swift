@@ -18,6 +18,13 @@ public actor LibraryStore {
     public let rootURL: URL
     private let indexURL: URL
     private var assetsByID: [WallpaperID: WallpaperAsset] = [:]
+    /// Last measured total and when it was taken. The stats label asks every
+    /// few seconds, and walking every asset folder for each tick dominated the
+    /// UI's background work. Store mutations invalidate it, and the TTL picks
+    /// up files written outside the store (the 720p battery sibling lives in
+    /// the asset folder, so a pure mutation hook would miss it).
+    private var cachedDiskUsage: (bytes: Int64, at: Date)?
+    private static let diskUsageTTL: TimeInterval = 5 * 60
 
     public init(rootURL: URL? = nil) throws {
         let base = try StorePaths.appSupportBase(rootURL: rootURL)
@@ -63,6 +70,9 @@ public actor LibraryStore {
         }
         assetsByID[asset.id] = asset
         try persist()
+        // The asset's media folder was written before install, so the cached
+        // total predates it.
+        invalidateDiskUsageCache()
     }
 
     public func update(_ asset: WallpaperAsset) throws {
@@ -107,6 +117,7 @@ public actor LibraryStore {
             throw StoreError.invalidLocation
         }
         try? FileManager.default.removeItem(at: folder)
+        invalidateDiskUsageCache()
     }
 
     public func folder(for id: WallpaperID) -> URL {
@@ -114,12 +125,24 @@ public actor LibraryStore {
     }
 
     public func diskUsageBytes() -> Int64 {
+        let now = Date()
+        if let cachedDiskUsage,
+           now.timeIntervalSince(cachedDiskUsage.at) < Self.diskUsageTTL {
+            return cachedDiskUsage.bytes
+        }
         let urls = FileManager.default.enumerator(at: rootURL, includingPropertiesForKeys: [.fileSizeKey])
         var total: Int64 = 0
         while let url = urls?.nextObject() as? URL {
             total += Int64((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
         }
+        cachedDiskUsage = (total, now)
         return total
+    }
+
+    /// Drops the cached total after media changes made outside this store's own
+    /// mutations, such as an import folder that was created and then removed.
+    func invalidateDiskUsageCache() {
+        cachedDiskUsage = nil
     }
 
     private func persist() throws {
